@@ -379,7 +379,17 @@ open class BarChartRenderer: BarLineScatterCandleBubbleRenderer
                 context.setFillColor(dataSet.color(atIndex: j).cgColor)
             }
             
-            context.fill(barRect)
+            if dataSet.isStacked
+            {
+                context.drawPath(using: .fill)
+            }
+            else
+            {
+                let bezierPath = UIBezierPath(roundedRect: barRect, cornerRadius: dataSet.barCornerRadius)
+                context.addPath(bezierPath.cgPath)
+                
+                context.drawPath(using: .fill)
+            }
             
             if drawBorder
             {
