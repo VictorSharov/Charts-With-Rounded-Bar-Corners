@@ -287,7 +287,8 @@ open class HorizontalBarChartRenderer: BarChartRenderer
             {
                 context.setStrokeColor(borderColor.cgColor)
                 context.setLineWidth(borderWidth)
-                context.stroke(barRect)
+                context.addPath(bezierPath.cgPath)
+                context.drawPath(using: .stroke)
             }
 
             // Create and append the corresponding accessibility element to accessibilityOrderedElements (see BarChartRenderer)
