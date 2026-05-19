@@ -779,14 +779,25 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
                 if recognizer.state == NSUIGestureRecognizerState.ended && isDragDecelerationEnabled
                 {
                     stopDeceleration()
-                    
+
                     _decelerationLastTime = CACurrentMediaTime()
                     _decelerationVelocity = recognizer.velocity(in: self)
-                    
+
                     _decelerationDisplayLink = NSUIDisplayLink(target: self, selector: #selector(BarLineChartViewBase.decelerationLoop))
                     _decelerationDisplayLink.add(to: RunLoop.main, forMode: RunLoop.Mode.common)
                 }
-                
+                else
+                {
+                    // No drag-momentum deceleration will run: the gesture was
+                    // .cancelled (an ancestor scroll view took over the touch),
+                    // or deceleration is disabled. The viewport is already at
+                    // its final rest position, so emit the same settled
+                    // callback the deceleration path uses — without it an
+                    // opt-in snap/paging consumer never runs for cancelled
+                    // pans and can leave a partially clipped item.
+                    delegate?.chartViewDidEndDecelerating?(self)
+                }
+
                 _isDragging = false
             }
             
