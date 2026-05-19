@@ -943,8 +943,23 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
         }
         
         _decelerationLastTime = currentTime
-        
-        if abs(_decelerationVelocity.x) < 0.001 && abs(_decelerationVelocity.y) < 0.001
+
+        let velocitySettled = abs(_decelerationVelocity.x) < 0.001
+            && abs(_decelerationVelocity.y) < 0.001
+
+        // DGCharts' 0.001 velocity floor leaves a multi-second sub-pixel tail
+        // (friction 0.9): a flick is visually frozen within ~0.7s but the loop
+        // grinds ~2s more toward the floor. For a plain free-scroll chart that
+        // is invisible, but a snap consumer gated on the floor only fires
+        // seconds later as a jarring jump after a dead pause. When a snap
+        // provider is set, end as soon as this frame's move is imperceptible
+        // (sub-pixel) so the snap continues the visible deceleration instead
+        // of waiting out the tail. Non-snap consumers keep the exact original
+        // stop behaviour.
+        let snapSettled = decelerationSnapXProvider != nil
+            && abs(distance.x) < 0.5 && abs(distance.y) < 0.5
+
+        if velocitySettled || snapSettled
         {
             stopDeceleration()
 
