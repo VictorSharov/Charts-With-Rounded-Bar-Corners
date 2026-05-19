@@ -44,11 +44,15 @@ public protocol ChartViewDelegate
     /// Not called when deceleration is interrupted by a new touch/pan (a fresh
     /// gesture stops the deceleration display link before it settles — the
     /// follow-up gesture's own terminal callback covers the rest position).
-    /// Lets a delegate snap the rested viewport to a meaningful boundary
-    /// without the library imposing any snap policy. Covering the cancelled
-    /// case matters for charts panned inside a scrollable ancestor: otherwise
-    /// a snap consumer never runs when the outer scroll wins gesture
-    /// arbitration mid-drag, leaving a partially clipped item.
+    /// When `decelerationSnapXProvider` is set the chart has, by this point,
+    /// already started the eased settle-snap toward the snapped boundary; the
+    /// callback fires immediately so a consumer can resync to the snapped
+    /// window (== round(restingX)) while the short glide plays. Without a
+    /// provider it is the raw rest position — letting a delegate apply its own
+    /// snap policy. Covering the cancelled case matters for charts panned
+    /// inside a scrollable ancestor: otherwise a snap consumer never runs when
+    /// the outer scroll wins gesture arbitration mid-drag, leaving a partially
+    /// clipped item.
     @objc optional func chartViewDidEndDecelerating(_ chartView: ChartViewBase)
     
     // Called when nothing has been selected or an "un-select" has been made.

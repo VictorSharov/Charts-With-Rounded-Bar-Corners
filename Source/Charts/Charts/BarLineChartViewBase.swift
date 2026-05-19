@@ -528,7 +528,23 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
     private var _decelerationLastTime: TimeInterval = 0.0
     private var _decelerationDisplayLink: NSUIDisplayLink!
     private var _decelerationVelocity = CGPoint()
-    
+
+    /// Opt-in paging hook — the `UIScrollView`
+    /// `scrollViewWillEndDragging(_:withVelocity:targetContentOffset:)`
+    /// equivalent this view otherwise lacks. When set, once a drag or flick
+    /// has settled (the finger is already up) the chart asks the provider for
+    /// a snapped left-edge x-value and glides there as the eased tail of the
+    /// same gesture, so the viewport always rests on a caller-defined boundary
+    /// (e.g. a whole bar) instead of an arbitrary fractional offset. The
+    /// argument is the rested `lowestVisibleX`; return it unchanged to opt out
+    /// for that gesture. Never invoked while the finger is down, so it cannot
+    /// fight an active pan.
+    @objc open var decelerationSnapXProvider: ((Double) -> Double)?
+
+    /// In-flight settle-snap animation, retained so a new touch can cancel it
+    /// (its display link is independent of `_decelerationDisplayLink`).
+    private var _snapViewJob: AnimatedMoveViewJob?
+
     @objc private func tapGestureRecognized(_ recognizer: NSUITapGestureRecognizer)
     {
         if data === nil
@@ -680,7 +696,12 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
         if recognizer.state == NSUIGestureRecognizerState.began && recognizer.nsuiNumberOfTouches() > 0
         {
             stopDeceleration()
-            
+
+            // A finger landing during the settle-snap glide takes over: stop
+            // the in-flight snap so it does not fight the new pan.
+            _snapViewJob?.stop(finish: false)
+            _snapViewJob = nil
+
             if data === nil || !self.isDragEnabled
             { // If we have no data, we have nothing to pan and no data to highlight
                 return
@@ -790,11 +811,12 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
                 {
                     // No drag-momentum deceleration will run: the gesture was
                     // .cancelled (an ancestor scroll view took over the touch),
-                    // or deceleration is disabled. The viewport is already at
-                    // its final rest position, so emit the same settled
-                    // callback the deceleration path uses — without it an
-                    // opt-in snap/paging consumer never runs for cancelled
-                    // pans and can leave a partially clipped item.
+                    // or deceleration is disabled. The finger is already up, so
+                    // settle onto the snapped boundary the same way the
+                    // deceleration path does, then emit the settled callback —
+                    // without this an opt-in snap/paging consumer never runs
+                    // for cancelled pans and can leave a partially clipped item.
+                    startDecelerationSnapIfNeeded()
                     delegate?.chartViewDidEndDecelerating?(self)
                 }
 
@@ -858,7 +880,47 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
             _decelerationDisplayLink = nil
         }
     }
-    
+
+    /// Settle the rested viewport onto the provider's snapped left-edge
+    /// x-value, animating the short residual as the eased tail of the same
+    /// gesture. Called only from finger-up settle points (deceleration stop /
+    /// pan-end with no deceleration), never during `.changed`, so it cannot
+    /// yank the chart from under a live drag. No-ops when no provider is set
+    /// or the rest is already on the boundary.
+    private func startDecelerationSnapIfNeeded()
+    {
+        guard let provider = decelerationSnapXProvider else { return }
+
+        let resting = lowestVisibleX
+        let target = provider(resting)
+        guard target.isFinite, abs(target - resting) > 1e-6 else { return }
+
+        _snapViewJob?.stop(finish: false)
+
+        // Mirrors moveViewToAnimated(xValue:yValue:axis:duration:) with the
+        // existing page-button feel (left axis, yValue 0), but keeps the job
+        // so a new touch (panGestureRecognized .began) can cancel it.
+        let bounds = valueForTouchPoint(
+            point: CGPoint(x: viewPortHandler.contentLeft, y: viewPortHandler.contentTop),
+            axis: .left)
+
+        let yInView = getAxisRange(axis: .left) / Double(viewPortHandler.scaleY)
+
+        let job = AnimatedMoveViewJob(
+            viewPortHandler: viewPortHandler,
+            xValue: target,
+            yValue: yInView / 2.0,
+            transformer: getTransformer(forAxis: .left),
+            view: self,
+            xOrigin: bounds.x,
+            yOrigin: bounds.y,
+            duration: 0.22,
+            easing: easingFunctionFromOption(.easeOutSine))
+
+        _snapViewJob = job
+        addViewportJob(job)
+    }
+
     @objc private func decelerationLoop()
     {
         let currentTime = CACurrentMediaTime()
@@ -889,6 +951,13 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
             // Range might have changed, which means that Y-axis labels could have changed in size, affecting Y-axis size. So we need to recalculate offsets.
             calculateOffsets()
             setNeedsDisplay()
+
+            // Drag momentum stopped at an arbitrary x. Glide the eased tail of
+            // the gesture onto the snapped boundary (finger already up — this
+            // never fights an active pan). The settled callback fires now so a
+            // consumer can resync to the snapped window while the short glide
+            // plays; the snapped window equals round(restingX) either way.
+            startDecelerationSnapIfNeeded()
 
             delegate?.chartViewDidEndDecelerating?(self)
         }
