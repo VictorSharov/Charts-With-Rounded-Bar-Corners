@@ -563,6 +563,14 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
     /// the finger is down, so it cannot fight an active pan.
     open var leftAxisSettleRangeProvider: ((Double) -> ClosedRange<Double>)?
 
+    /// Tuning for the `leftAxisSettleRangeProvider` ease. Defaults match the X
+    /// residual snap feel (`startDecelerationSnapIfNeeded`); a consumer can
+    /// soften the abrupt fast-start by switching to an ease-in-out and/or a
+    /// longer duration without a fork round-trip.
+    open var leftAxisSettleDuration: TimeInterval = 0.22
+
+    open var leftAxisSettleEasingOption: ChartEasingOption = .easeOutSine
+
     /// In-flight axis-range ease, reusing the chart's animation engine so the
     /// scale change rides the same display link / easing as the X settle.
     /// Independent of `_snapViewJob` (that moves the viewport; this moves the
@@ -1095,8 +1103,11 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
             self.applyLeftAxisRange(min: self._axisSettleToMin, max: self._axisSettleToMax)
         }
 
-        // Same feel as the X residual snap (startDecelerationSnapIfNeeded).
-        _axisSettleAnimator.animate(xAxisDuration: 0.22, easingOption: .easeOutSine)
+        // Defaults match the X residual snap (startDecelerationSnapIfNeeded);
+        // a consumer can override leftAxisSettleDuration / EasingOption.
+        _axisSettleAnimator.animate(
+            xAxisDuration: leftAxisSettleDuration,
+            easingOption: leftAxisSettleEasingOption)
     }
 
     /// Freeze any in-flight axis ease at its current value without snapping to
