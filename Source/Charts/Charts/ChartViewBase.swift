@@ -44,12 +44,14 @@ public protocol ChartViewDelegate
     /// Not called when deceleration is interrupted by a new touch/pan (a fresh
     /// gesture stops the deceleration display link before it settles — the
     /// follow-up gesture's own terminal callback covers the rest position).
-    /// When `decelerationSnapXProvider` is set the chart has, by this point,
-    /// already started the eased settle-snap toward the snapped boundary; the
-    /// callback fires immediately so a consumer can resync to the snapped
-    /// window (== round(restingX)) while the short glide plays. Without a
-    /// provider it is the raw rest position — letting a delegate apply its own
-    /// snap policy. Covering the cancelled case matters for charts panned
+    /// When `decelerationSnapXProvider` is set a momentum deceleration was
+    /// redirected so the friction curve itself lands on the snapped boundary
+    /// (case 2 / sub-pixel residuals finish with a short eased move); by this
+    /// point the chart is at — or imperceptibly gliding the last <1px onto —
+    /// that boundary, and the callback fires so a consumer can resync to the
+    /// snapped window (== round(restingX)). Without a provider it is the raw
+    /// rest position — letting a delegate apply its own snap policy. Covering
+    /// the cancelled case matters for charts panned
     /// inside a scrollable ancestor: otherwise a snap consumer never runs when
     /// the outer scroll wins gesture arbitration mid-drag, leaving a partially
     /// clipped item.

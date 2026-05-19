@@ -545,6 +545,14 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
     /// (its display link is independent of `_decelerationDisplayLink`).
     private var _snapViewJob: AnimatedMoveViewJob?
 
+    /// Set when momentum deceleration starts with a snap provider. The first
+    /// `decelerationLoop` frame then redirects the x-velocity — using its own
+    /// measured frame interval, so it is refresh-rate correct (incl.
+    /// ProMotion) — so the unchanged friction curve ends exactly on the
+    /// snapped boundary: one continuous motion, no separate fixed-duration
+    /// glide.
+    private var _decelerationSnapPending = false
+
     @objc private func tapGestureRecognized(_ recognizer: NSUITapGestureRecognizer)
     {
         if data === nil
@@ -803,6 +811,7 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
 
                     _decelerationLastTime = CACurrentMediaTime()
                     _decelerationVelocity = recognizer.velocity(in: self)
+                    _decelerationSnapPending = decelerationSnapXProvider != nil
 
                     _decelerationDisplayLink = NSUIDisplayLink(target: self, selector: #selector(BarLineChartViewBase.decelerationLoop))
                     _decelerationDisplayLink.add(to: RunLoop.main, forMode: RunLoop.Mode.common)
@@ -879,21 +888,41 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
             _decelerationDisplayLink.remove(from: RunLoop.main, forMode: RunLoop.Mode.common)
             _decelerationDisplayLink = nil
         }
+
+        // Any teardown (.began, .ended, settle, cancel) clears a not-yet-run
+        // redirect so it can never fire on an unrelated later deceleration.
+        _decelerationSnapPending = false
     }
 
-    /// Settle the rested viewport onto the provider's snapped left-edge
-    /// x-value, animating the short residual as the eased tail of the same
-    /// gesture. Called only from finger-up settle points (deceleration stop /
-    /// pan-end with no deceleration), never during `.changed`, so it cannot
-    /// yank the chart from under a live drag. No-ops when no provider is set
-    /// or the rest is already on the boundary.
+    /// Finish a finger-up settle that the friction curve itself did not place
+    /// on the boundary: a no-momentum lift, a `.cancelled`/outer-scroll pan,
+    /// or a redirected deceleration that stopped a sub-pixel short. Animates
+    /// the short residual as an eased move to the provider's snapped
+    /// left-edge x-value. Called only from finger-up settle points
+    /// (deceleration stop / pan-end with no deceleration), never during
+    /// `.changed`, so it cannot yank the chart from under a live drag. No-ops
+    /// when no provider is set or the residual is already sub-pixel (a
+    /// redirected momentum deceleration lands here ⇒ no second motion).
     private func startDecelerationSnapIfNeeded()
     {
         guard let provider = decelerationSnapXProvider else { return }
 
         let resting = lowestVisibleX
         let target = provider(resting)
-        guard target.isFinite, abs(target - resting) > 1e-6 else { return }
+        guard target.isFinite else { return }
+
+        // Treat a sub-pixel residual as "already there". After a redirected
+        // deceleration the loop stops within <1px of the boundary; a
+        // fixed-duration glide over an invisible distance is exactly the
+        // inconsistent-speed artifact this whole path avoids.
+        let sampled = valueForTouchPoint(
+            point: CGPoint(x: viewPortHandler.contentLeft + 1, y: viewPortHandler.contentBottom),
+            axis: .left).x
+        let valuePerPx = abs(Double(sampled) - resting)
+        let residualPx = valuePerPx > .ulpOfOne
+            ? abs(target - resting) / valuePerPx
+            : Double.infinity
+        guard residualPx > 1 else { return }
 
         _snapViewJob?.stop(finish: false)
 
@@ -921,6 +950,63 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
         addViewportJob(job)
     }
 
+    /// Approach-B redirect, run once on the first momentum frame. Projects
+    /// where the friction loop would naturally stop (closed-form geometric
+    /// travel `vₙ·dt/(1−c)` using the *measured* frame interval — refresh-rate
+    /// correct, incl. ProMotion), asks the provider for the snapped boundary
+    /// nearest that endpoint, and scales the x-velocity so the unchanged
+    /// friction curve ends exactly there. Result: one continuous deceleration
+    /// that lands on a date — no separate fixed-duration glide, so the settle
+    /// is always the natural decel speed (consistent), and the strip edge is
+    /// handled because the provider clamps the target up front. Every guard
+    /// falls back to the untouched loop (today's behaviour), so it can never
+    /// regress.
+    private func redirectDecelerationToSnapTarget(frameInterval: CGFloat)
+    {
+        guard let provider = decelerationSnapXProvider else { return }
+
+        let c = dragDecelerationFrictionCoef
+        guard c > 0, c < 1, frameInterval > 0 else { return }
+
+        // Cap a hitch between .ended and the first display-link tick so it
+        // cannot grossly inflate the projection (33ms ≫ any real frame).
+        let dt = min(frameInterval, 1.0 / 30.0)
+
+        // Remaining pixel travel from the just-decayed velocity:
+        // Σ_{k≥0} vₙ·cᵏ·dt = vₙ·dt/(1−c).
+        let projectedTravelPx = _decelerationVelocity.x * dt / (1 - c)
+
+        let leftValue = lowestVisibleX
+        let sampled = valueForTouchPoint(
+            point: CGPoint(x: viewPortHandler.contentLeft + 1, y: viewPortHandler.contentBottom),
+            axis: .left).x
+        let valuePerPx = Double(sampled) - leftValue
+        guard valuePerPx.isFinite, abs(valuePerPx) > .ulpOfOne else { return }
+
+        // performPanChange concatenates +translationX (= +velocity.x), moving
+        // content right ⇒ the value at the fixed left edge decreases. Sign is
+        // transformer-derived, so it stays correct if the x-axis is inverted.
+        let naturalEnd = leftValue - Double(projectedTravelPx) * valuePerPx
+        let target = provider(naturalEnd)
+        guard target.isFinite else { return }
+
+        let naturalDelta = naturalEnd - leftValue
+        let targetDelta = target - leftValue
+
+        // Only redirect a real flick (≥ ~half a slot of natural travel).
+        // Gentle lifts fall through to the loop's own settle + the
+        // sub-pixel-guarded startDecelerationSnapIfNeeded (redirecting them
+        // would divide by ~0).
+        guard abs(naturalDelta) >= 0.5 else { return }
+
+        let factor = targetDelta / naturalDelta
+        guard factor.isFinite, factor > 0 else { return }
+
+        // Same friction curve, scaled start velocity ⇒ identical-looking
+        // motion that simply ends on the snapped date.
+        _decelerationVelocity.x *= CGFloat(factor)
+    }
+
     @objc private func decelerationLoop()
     {
         let currentTime = CACurrentMediaTime()
@@ -929,7 +1015,15 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
         _decelerationVelocity.y *= self.dragDecelerationFrictionCoef
         
         let timeInterval = CGFloat(currentTime - _decelerationLastTime)
-        
+
+        // First momentum frame: aim the friction curve at the snapped date
+        // using this frame's real interval, before any pixels are applied.
+        if _decelerationSnapPending
+        {
+            _decelerationSnapPending = false
+            redirectDecelerationToSnapTarget(frameInterval: timeInterval)
+        }
+
         let distance = CGPoint(
             x: _decelerationVelocity.x * timeInterval,
             y: _decelerationVelocity.y * timeInterval
@@ -967,11 +1061,12 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
             calculateOffsets()
             setNeedsDisplay()
 
-            // Drag momentum stopped at an arbitrary x. Glide the eased tail of
-            // the gesture onto the snapped boundary (finger already up — this
-            // never fights an active pan). The settled callback fires now so a
-            // consumer can resync to the snapped window while the short glide
-            // plays; the snapped window equals round(restingX) either way.
+            // A redirected momentum deceleration already landed on the date,
+            // so this is a sub-pixel no-op for that path; it only finishes a
+            // residual the friction curve could not place (no-momentum lift,
+            // outer-scroll/edge case). Finger is already up — never fights an
+            // active pan. The settled callback fires now so a consumer can
+            // resync to the snapped window (== round(restingX)).
             startDecelerationSnapIfNeeded()
 
             delegate?.chartViewDidEndDecelerating?(self)
