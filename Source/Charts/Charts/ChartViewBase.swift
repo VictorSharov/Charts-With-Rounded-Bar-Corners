@@ -33,6 +33,14 @@ public protocol ChartViewDelegate
     
     /// Called when a user stops panning between values on the chart
     @objc optional func chartViewDidEndPanning(_ chartView: ChartViewBase)
+
+    /// Called when drag-momentum deceleration has fully settled on its own —
+    /// velocity decayed below the stop threshold or the content edge was
+    /// reached. Not called when deceleration is interrupted by a new
+    /// touch/pan (a fresh gesture stops the deceleration display link before
+    /// it settles). Lets a delegate snap the rested viewport to a meaningful
+    /// boundary after a flick, without the library imposing any snap policy.
+    @objc optional func chartViewDidEndDecelerating(_ chartView: ChartViewBase)
     
     // Called when nothing has been selected or an "un-select" has been made.
     @objc optional func chartValueNothingSelected(_ chartView: ChartViewBase)
