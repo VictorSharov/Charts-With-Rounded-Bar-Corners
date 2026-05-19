@@ -553,6 +553,27 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
     /// glide.
     private var _decelerationSnapPending = false
 
+    /// Opt-in companion to `decelerationSnapXProvider`. Once the pan/momentum
+    /// has settled on its (snapped) window, the chart asks the provider for the
+    /// left (Y) axis range that window should show and *eases*
+    /// `leftAxis.axisMinimum` / `axisMaximum` into it, on the same easing as the
+    /// X settle, instead of the caller hard-applying the new range (which
+    /// teleports the curve in a single frame). The argument is the settled
+    /// `lowestVisibleX`; return the closed range to display. Never invoked while
+    /// the finger is down, so it cannot fight an active pan.
+    open var leftAxisSettleRangeProvider: ((Double) -> ClosedRange<Double>)?
+
+    /// In-flight axis-range ease, reusing the chart's animation engine so the
+    /// scale change rides the same display link / easing as the X settle.
+    /// Independent of `_snapViewJob` (that moves the viewport; this moves the
+    /// data-space axis bounds), retained so a new touch can cancel it.
+    private let _axisSettleAnimator = Animator()
+
+    private var _axisSettleFromMin = 0.0
+    private var _axisSettleFromMax = 0.0
+    private var _axisSettleToMin = 0.0
+    private var _axisSettleToMax = 0.0
+
     @objc private func tapGestureRecognized(_ recognizer: NSUITapGestureRecognizer)
     {
         if data === nil
@@ -709,6 +730,9 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
             // the in-flight snap so it does not fight the new pan.
             _snapViewJob?.stop(finish: false)
             _snapViewJob = nil
+            // Same for an in-flight axis-range ease: freeze it where it is so
+            // the new gesture continues from the current scale.
+            cancelAxisSettle()
 
             if data === nil || !self.isDragEnabled
             { // If we have no data, we have nothing to pan and no data to highlight
@@ -826,6 +850,7 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
                     // without this an opt-in snap/paging consumer never runs
                     // for cancelled pans and can leave a partially clipped item.
                     startDecelerationSnapIfNeeded()
+                    startAxisSettleIfNeeded()
                     delegate?.chartViewDidEndDecelerating?(self)
                 }
 
@@ -1007,6 +1032,98 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
         _decelerationVelocity.x *= CGFloat(factor)
     }
 
+    /// Programmatic counterpart for non-gesture viewport moves (e.g. a page
+    /// button that animates the viewport): eases the left axis to the range the
+    /// provider returns for `restedX`, on the same curve as a gesture settle.
+    /// Pass the *target* x for an animated move (its `lowestVisibleX` is still
+    /// mid-flight when this is called).
+    @objc open func animateLeftAxisSettle(towardRestedX restedX: Double)
+    {
+        startAxisSettle(towardRestedX: restedX)
+    }
+
+    /// Gesture settle hook: ease the left axis to the rested window's range.
+    /// Called only from finger-up settle points (deceleration stop / pan-end
+    /// with no deceleration), never during `.changed`, so it cannot fight an
+    /// active pan. No-ops without a provider.
+    private func startAxisSettleIfNeeded()
+    {
+        guard leftAxisSettleRangeProvider != nil else { return }
+        startAxisSettle(towardRestedX: lowestVisibleX)
+    }
+
+    private func startAxisSettle(towardRestedX restedX: Double)
+    {
+        guard let provider = leftAxisSettleRangeProvider else { return }
+
+        let target = provider(restedX)
+        let toMin = target.lowerBound
+        let toMax = target.upperBound
+        guard toMin.isFinite, toMax.isFinite, toMax > toMin else { return }
+
+        // Re-target smoothly from wherever a previous ease currently is (no
+        // forced jump to the old target); mirrors _snapViewJob?.stop(finish:false).
+        cancelAxisSettle()
+
+        let fromMin = leftAxis.axisMinimum
+        let fromMax = leftAxis.axisMaximum
+
+        // Already there (sub-threshold): set exact, no animation — a
+        // fixed-duration ease over an invisible delta is the inconsistent-speed
+        // artifact this settle path avoids (mirrors startDecelerationSnapIfNeeded).
+        let eps = Swift.max(abs(fromMax - fromMin), 1.0) * 1e-3
+        if abs(toMin - fromMin) < eps && abs(toMax - fromMax) < eps
+        {
+            applyLeftAxisRange(min: toMin, max: toMax)
+            return
+        }
+
+        _axisSettleFromMin = fromMin
+        _axisSettleFromMax = fromMax
+        _axisSettleToMin = toMin
+        _axisSettleToMax = toMax
+
+        _axisSettleAnimator.updateBlock = { [weak self] in
+            guard let self = self else { return }
+            let t = self._axisSettleAnimator.phaseX
+            self.applyLeftAxisRange(
+                min: self._axisSettleFromMin + (self._axisSettleToMin - self._axisSettleFromMin) * t,
+                max: self._axisSettleFromMax + (self._axisSettleToMax - self._axisSettleFromMax) * t)
+        }
+        _axisSettleAnimator.stopBlock = { [weak self] in
+            guard let self = self else { return }
+            self.applyLeftAxisRange(min: self._axisSettleToMin, max: self._axisSettleToMax)
+        }
+
+        // Same feel as the X residual snap (startDecelerationSnapIfNeeded).
+        _axisSettleAnimator.animate(xAxisDuration: 0.22, easingOption: .easeOutSine)
+    }
+
+    /// Freeze any in-flight axis ease at its current value without snapping to
+    /// the target (clears the blocks so Animator.stop()'s forced final tick is
+    /// inert), so a new gesture continues from the current scale.
+    private func cancelAxisSettle()
+    {
+        _axisSettleAnimator.updateBlock = nil
+        _axisSettleAnimator.stopBlock = nil
+        _axisSettleAnimator.stop()
+    }
+
+    private func applyLeftAxisRange(min: Double, max: Double)
+    {
+        leftAxis.axisMinimum = min
+        leftAxis.axisMaximum = max
+        leftYAxisRenderer.computeAxis(
+            min: leftAxis._axisMinimum,
+            max: leftAxis._axisMaximum,
+            inverted: leftAxis.isInverted)
+        // Y label width can change with the range → recompute offsets so the
+        // plot rect (hence the X mapping) stays consistent, exactly as the
+        // existing post-settle path already does.
+        calculateOffsets()
+        setNeedsDisplay()
+    }
+
     @objc private func decelerationLoop()
     {
         let currentTime = CACurrentMediaTime()
@@ -1068,6 +1185,7 @@ open class BarLineChartViewBase: ChartViewBase, BarLineScatterCandleBubbleChartD
             // active pan. The settled callback fires now so a consumer can
             // resync to the snapped window (== round(restingX)).
             startDecelerationSnapIfNeeded()
+            startAxisSettleIfNeeded()
 
             delegate?.chartViewDidEndDecelerating?(self)
         }
